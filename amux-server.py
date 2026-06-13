@@ -2326,17 +2326,21 @@ def _claude_ui_visible(clean_output: str) -> bool:
             # Codex model status line: "gpt-X xhigh · ~/path"
             if "·" in ls and ("gpt-" in ls or "o3" in ls or "o4" in ls):
                 return True
-    # Gemini CLI prompt/status. Gemini's UI is also Ink-based and may use
-    # ">" / "›" prompt lines, but only treat those as ready if the banner/model
-    # is visible somewhere in the recent pane.
-    has_gemini = any("gemini" in l.lower() for l in lines[:20] + lines[-12:])
-    if has_gemini:
+    # Gemini / agy (Antigravity) CLI prompt/status. UI uses ">" / "›" prompt
+    # lines; only treat those as active if the banner/model is visible in pane.
+    has_gemini_agy = any(
+        "gemini" in l.lower() or "agy" in l.lower() or "antigravity" in l.lower()
+        for l in lines[:20] + lines[-12:]
+    )
+    if has_gemini_agy:
         for l in lines[-8:]:
             ls = l.strip().lower()
             if ls == ">" or ls.startswith("> ") or ls.startswith("›"):
                 return True
-            if "gemini-" in ls or "yolo" in ls or "approval" in ls:
+            if "gemini-" in ls or "yolo" in ls or "approval" in ls or "dangerously-skip" in ls:
                 return True
+    # Hermes Agent REPL uses the same ❯ prompt character as Claude (already caught
+    # by the dingbat-range spinner check above), so no extra pattern needed.
     return False
 
 
@@ -2418,10 +2422,13 @@ def _snapshot_all_sessions_inner():
             clean = _STRIP_ANSI.sub("", output)
             now = time.time()
             actions = _session_auto_actions.setdefault(name, {})
+            _watchdog_cfg = parse_env_file(f)
+            _watchdog_provider = _watchdog_cfg.get("CC_PROVIDER", "claude").strip().lower()
+            _is_claude_native = _watchdog_provider not in ("codex", "gemini", "agy", "hermes", "iterm2")
 
             # ── 1. Proactive: auto-compact when context is low ──────────────
-            # Skip if the context % appears in /status output (user was just checking)
-            ctx_match = re.search(r'context left until auto-compact[:\s]+(\d+)%', clean, re.IGNORECASE)
+            # (Claude-native only — hermes/agy/codex manage their own context)
+            ctx_match = _is_claude_native and re.search(r'context left until auto-compact[:\s]+(\d+)%', clean, re.IGNORECASE)
             _from_status_cmd = bool(ctx_match and re.search(r'❯\s*/status', clean))
             if ctx_match and not _from_status_cmd:
                 pct = int(ctx_match.group(1))
@@ -2476,7 +2483,9 @@ def _snapshot_all_sessions_inner():
                 actions.pop("img_corrupt_compacted", None)
 
             # ── 2. Reactive: thinking-block corruption → restart + replay ───
-            if ("redacted_thinking" in clean and
+            # (Claude-native only — error is specific to Claude's thinking blocks)
+            if (_is_claude_native and
+                    "redacted_thinking" in clean and
                     "cannot be modified" in clean and
                     now - actions.get("last_restart", 0) > 120):
                 actions["last_restart"] = now
@@ -2495,8 +2504,9 @@ def _snapshot_all_sessions_inner():
 
             # ── 2b. Reactive: session ID already in use → hard-kill + restart ─
             # Claude Code exits with "Session ID ... is already in use" when a
-            # stale process holds the lock.
-            if ("is already in use" in clean and "Session ID" in clean and
+            # stale process holds the lock. (Claude-native only)
+            if (_is_claude_native and
+                    "is already in use" in clean and "Session ID" in clean and
                     now - actions.get("last_restart", 0) > 120):
                 actions["last_restart"] = now
                 wd = _session_work_dir(name)
@@ -5877,7 +5887,7 @@ def list_sessions() -> list:
         raw_dir = cfg.get("CC_DIR", "")
         resolved_dir = str(Path(raw_dir).expanduser().resolve()) if raw_dir else ""
         provider = cfg.get("CC_PROVIDER", "claude")
-        if provider in ("codex", "gemini"):
+        if provider in ("codex", "gemini", "agy", "hermes"):
             active_model = _extract_model_from_flags(cfg.get("CC_FLAGS", "")) or _default_model_for_provider(provider)
         else:
             active_model = detect_active_model(raw_dir, meta.get("cc_conversation_id", ""))
@@ -6637,7 +6647,7 @@ def _validate_model_name(value) -> tuple[bool, str, str]:
     return True, normalized, ""
 
 
-_SESSION_PROVIDERS = ("claude", "codex", "gemini", "iterm2")
+_SESSION_PROVIDERS = ("claude", "codex", "gemini", "agy", "hermes", "iterm2")
 
 
 _PROVIDER_YOLO_FLAGS = (
@@ -6652,6 +6662,8 @@ def _default_model_for_provider(provider: str) -> str:
         return "gpt-5.5"
     if provider == "gemini":
         return "auto"
+    if provider in ("agy", "hermes"):
+        return ""   # these tools use their own configured defaults
     return _get_default_model()
 
 
@@ -6659,7 +6671,9 @@ def _provider_label(provider: str) -> str:
     return {
         "claude": "Claude Code",
         "codex": "Codex",
-        "gemini": "Gemini",
+        "gemini": "Gemini (deprecated)",
+        "agy": "Antigravity",
+        "hermes": "Hermes Agent",
         "iterm2": "iTerm2",
     }.get(provider, provider or "Claude Code")
 
@@ -6667,9 +6681,9 @@ def _provider_label(provider: str) -> str:
 def _provider_yolo_flag(provider: str) -> str:
     if provider == "codex":
         return "--dangerously-bypass-approvals-and-sandbox"
-    if provider == "gemini":
+    if provider in ("gemini", "hermes"):
         return "--yolo"
-    return "--dangerously-skip-permissions"
+    return "--dangerously-skip-permissions"  # claude + agy
 
 
 def _strip_provider_yolo_flags(flags: str) -> str:
@@ -7138,54 +7152,71 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
             else:
                 cmd = f"codex{_codex_opts}"
                 print(f"[start] {name}: codex fresh start")
-        elif provider == "gemini":
-            gemini_session_id = meta.get("gemini_session_id", "")
-            _gemini_flags = flags or ""
-            _gemini_yolo = False
-            if (
-                any(f in _gemini_flags for f in _PROVIDER_YOLO_FLAGS)
-                or "--approval-mode=yolo" in _gemini_flags
-                or "--approval-mode yolo" in _gemini_flags
-            ):
-                _gemini_yolo = True
-                _gemini_flags = _strip_provider_yolo_flags(_gemini_flags)
-            _gemini_opts = ""
-            if _gemini_flags:
-                _gemini_opts += f" {_shell_quote_flags(_gemini_flags)}"
+        elif provider in ("gemini", "agy"):
+            # "gemini" is a deprecated alias — both run via the agy binary
+            _agy_started = meta.get("agy_started", False)
+            _agy_conv_id = meta.get("agy_conversation_id", "")
+            _agy_flags = flags or ""
+            _agy_yolo = any(f in _agy_flags for f in _PROVIDER_YOLO_FLAGS)
+            if _agy_yolo:
+                _agy_flags = _strip_provider_yolo_flags(_agy_flags)
+            _agy_opts = ""
+            if _agy_flags:
+                _agy_opts += f" {_shell_quote_flags(_agy_flags)}"
             if extra_flags:
-                _gemini_opts += f" {_shell_quote_flags(extra_flags)}"
-            if "--model" not in _gemini_opts and "-m " not in _gemini_opts:
-                _gemini_opts += " --model auto"
-            if _gemini_yolo and "--yolo" not in _gemini_opts and "--approval-mode" not in _gemini_opts:
-                _gemini_opts += " --yolo"
-            if "--skip-trust" not in _gemini_opts:
-                _gemini_opts += " --skip-trust"
-            include_dirs = [str(CC_LOGS)]
+                _agy_opts += f" {_shell_quote_flags(extra_flags)}"
+            if _agy_yolo and "--dangerously-skip-permissions" not in _agy_opts:
+                _agy_opts += " --dangerously-skip-permissions"
+            # Add directories to workspace (agy uses --add-dir, same as codex)
+            _agy_dirs = [str(CC_LOGS)]
             try:
                 _gr = subprocess.run(
                     ["git", "-C", work_dir, "rev-parse", "--show-toplevel"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if _gr.returncode == 0:
-                    git_root = _gr.stdout.strip()
-                    if git_root and git_root != work_dir:
-                        include_dirs.append(git_root)
-                    git_dir = os.path.join(git_root, ".git")
-                    if os.path.isdir(git_dir):
-                        include_dirs.append(git_dir)
+                    _git_root = _gr.stdout.strip()
+                    if _git_root and _git_root != work_dir:
+                        _agy_dirs.append(_git_root)
+                    _git_dir = os.path.join(_git_root, ".git")
+                    if os.path.isdir(_git_dir):
+                        _agy_dirs.append(_git_dir)
             except Exception:
                 pass
-            for include_dir in dict.fromkeys(include_dirs):
-                if include_dir and include_dir not in _gemini_opts:
-                    _gemini_opts += f" --include-directories {shlex.quote(include_dir)}"
-            if gemini_session_id:
-                cmd = f"gemini{_gemini_opts} --resume {shlex.quote(gemini_session_id)}"
-                print(f"[start] {name}: gemini resume {gemini_session_id}")
+            for _agy_dir in dict.fromkeys(_agy_dirs):
+                if _agy_dir and _agy_dir not in _agy_opts:
+                    _agy_opts += f" --add-dir {shlex.quote(_agy_dir)}"
+            if _agy_conv_id:
+                cmd = f"agy{_agy_opts} --conversation {shlex.quote(_agy_conv_id)}"
+                print(f"[start] {name}: agy resume conversation {_agy_conv_id}")
+            elif _agy_started:
+                # Resume the most recent agy conversation (no stored ID available)
+                cmd = f"agy{_agy_opts} --continue"
+                print(f"[start] {name}: agy --continue (resume most recent)")
             else:
-                gemini_session_id = str(uuid.uuid4())
-                meta["gemini_session_id"] = gemini_session_id
-                cmd = f"gemini{_gemini_opts} --session-id {shlex.quote(gemini_session_id)}"
-                print(f"[start] {name}: gemini fresh start {gemini_session_id}")
+                meta["agy_started"] = True
+                _save_meta(name, meta)
+                cmd = f"agy{_agy_opts}"
+                print(f"[start] {name}: agy fresh start")
+        elif provider == "hermes":
+            _hermes_session_id = meta.get("hermes_session_id", "")
+            _hermes_flags = flags or ""
+            _hermes_yolo = any(f in _hermes_flags for f in _PROVIDER_YOLO_FLAGS)
+            if _hermes_yolo:
+                _hermes_flags = _strip_provider_yolo_flags(_hermes_flags)
+            _hermes_opts = ""
+            if _hermes_flags:
+                _hermes_opts += f" {_shell_quote_flags(_hermes_flags)}"
+            if extra_flags:
+                _hermes_opts += f" {_shell_quote_flags(extra_flags)}"
+            if _hermes_yolo and "--yolo" not in _hermes_opts:
+                _hermes_opts += " --yolo"
+            if _hermes_session_id:
+                cmd = f"hermes{_hermes_opts} --resume {shlex.quote(_hermes_session_id)}"
+                print(f"[start] {name}: hermes resume {_hermes_session_id}")
+            else:
+                cmd = f"hermes{_hermes_opts}"
+                print(f"[start] {name}: hermes fresh start")
         else:
             cmd = "claude"
             if default_flags:
@@ -7208,28 +7239,29 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 cmd += " --model sonnet"
         try:
             tmux_sess = tmux_name(name)
-            # Build shell setup string — skip Claude env cleanup for codex
+            # Build shell setup string — skip Claude env cleanup for codex/agy
             _has_oauth = False
-            if provider in ("codex", "gemini"):
+            if provider in ("codex", "gemini", "agy"):
                 shell_rc = ""
             else:
                 shell_rc = "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
-                try:
-                    import json as _j2
-                    _cj = Path.home() / ".claude.json"
-                    if _cj.exists():
-                        _has_oauth = bool(_j2.loads(_cj.read_text()).get("oauthAccount"))
-                except Exception:
-                    pass
-                if _has_oauth:
-                    shell_rc += "unset ANTHROPIC_API_KEY; "
+                if provider == "claude":
+                    try:
+                        import json as _j2
+                        _cj = Path.home() / ".claude.json"
+                        if _cj.exists():
+                            _has_oauth = bool(_j2.loads(_cj.read_text()).get("oauthAccount"))
+                    except Exception:
+                        pass
+                    if _has_oauth:
+                        shell_rc += "unset ANTHROPIC_API_KEY; "
             for rc in [Path.home() / ".zprofile", Path.home() / ".bash_profile", Path.home() / ".profile"]:
                 if rc.exists():
                     shell_rc += f"source {rc} 2>/dev/null; cd {shlex.quote(work_dir)}; "
                     break
             else:
                 shell_rc += f"cd {shlex.quote(work_dir)}; "
-            if provider not in ("codex", "gemini") and _has_oauth:
+            if provider == "claude" and _has_oauth:
                 shell_rc += "unset ANTHROPIC_API_KEY; "
             # Forward select env vars into the tmux session.
             _env_args = []
@@ -7355,8 +7387,8 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                                capture_output=True, timeout=5)
                 _poll_shell_prompt(name, timeout=3.0)  # let profile source complete
     
-            # Ensure ANTHROPIC_API_KEY is unset when OAuth is available
-            if _has_oauth and provider not in ("codex", "gemini"):
+            # Ensure ANTHROPIC_API_KEY is unset when OAuth is available (claude only)
+            if _has_oauth and provider == "claude":
                 subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), "-l",
                                 "unset ANTHROPIC_API_KEY"],
                                capture_output=True, timeout=5)
@@ -7499,6 +7531,31 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                         _save_meta(sname, m)
                         print(f"[start] {sname}: captured codex session {sid}")
                 threading.Thread(target=_capture_codex_id, daemon=True).start()
+            # For hermes: capture the new session ID after startup so future restarts
+            # can use --resume <id> to land in the exact same conversation.
+            if provider == "hermes" and not meta.get("hermes_session_id"):
+                def _capture_hermes_id(sname=name):
+                    time.sleep(5)
+                    try:
+                        r_h = subprocess.run(
+                            ["hermes", "sessions", "list", "--limit", "1"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if r_h.returncode == 0:
+                            for _hl in r_h.stdout.splitlines():
+                                if _hl.startswith("─") or _hl.startswith("Title"):
+                                    continue
+                                _hid = _hl.strip().split()[-1] if _hl.strip() else ""
+                                if _hid and not _hid.startswith("─"):
+                                    m = _load_meta(sname)
+                                    if not m.get("hermes_session_id"):
+                                        m["hermes_session_id"] = _hid
+                                        _save_meta(sname, m)
+                                        print(f"[start] {sname}: captured hermes session {_hid}")
+                                    break
+                    except Exception as _e:
+                        print(f"[start] {sname}: hermes session ID capture failed: {_e}")
+                threading.Thread(target=_capture_hermes_id, daemon=True).start()
             _save_meta(name, meta)
             if pending_log_reload:
                 _start_pending_log_reload_thread(name, pending_log_reload_reason)
@@ -13617,7 +13674,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="display:flex;gap:6px;">
         <button type="button" id="create-provider-claude" class="btn provider-btn selected" onclick="_selectProvider('claude')">Claude Code</button>
         <button type="button" id="create-provider-codex" class="btn provider-btn" onclick="_selectProvider('codex')">Codex</button>
-        <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')">Gemini</button>
+        <button type="button" id="create-provider-agy" class="btn provider-btn" onclick="_selectProvider('agy')">Antigravity</button>
+        <button type="button" id="create-provider-hermes" class="btn provider-btn" onclick="_selectProvider('hermes')">Hermes</button>
+        <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')" title="Deprecated — use Antigravity instead" style="opacity:0.5">Gemini</button>
       </div>
     </div>
     <div class="field-group">
@@ -15400,18 +15459,21 @@ function flagValue(flags, flag) {
 function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'gemini') return 'Gemini';
+  if (provider === 'agy') return 'Antigravity';
+  if (provider === 'hermes') return 'Hermes';
   if (provider === 'iterm2') return 'iTerm2';
   return 'Claude';
 }
 
 function sessionProvider(s) {
   const p = ((s && s.provider) || 'claude').toLowerCase();
-  return (p === 'codex' || p === 'gemini' || p === 'iterm2') ? p : 'claude';
+  return (p === 'codex' || p === 'gemini' || p === 'agy' || p === 'hermes' || p === 'iterm2') ? p : 'claude';
 }
 
 function providerDefaultModel(provider) {
   if (provider === 'codex') return 'gpt-5.5';
   if (provider === 'gemini') return 'auto';
+  if (provider === 'agy' || provider === 'hermes') return '';
   return window._AMUX_DEFAULT_MODEL || 'sonnet';
 }
 
@@ -15422,8 +15484,8 @@ function sessionConfiguredModel(s) {
 
 function providerYoloFlag(provider) {
   if (provider === 'codex') return '--dangerously-bypass-approvals-and-sandbox';
-  if (provider === 'gemini') return '--yolo';
-  return '--dangerously-skip-permissions';
+  if (provider === 'gemini' || provider === 'hermes') return '--yolo';
+  return '--dangerously-skip-permissions';  // claude + agy
 }
 
 function stripProviderYoloFlags(flags) {
@@ -16317,7 +16379,9 @@ function editField(session, field, current, provider) {
     const providers = [
       {v:'claude',l:'Claude Code'},
       {v:'codex',l:'Codex'},
-      {v:'gemini',l:'Gemini'}
+      {v:'agy',l:'Antigravity'},
+      {v:'hermes',l:'Hermes'},
+      {v:'gemini',l:'Gemini (deprecated)'}
     ];
     sel.innerHTML = '';
     providers.forEach(p => { const o = document.createElement('option'); o.value = p.v; o.textContent = p.l; sel.appendChild(o); });
@@ -16343,7 +16407,23 @@ function editField(session, field, current, provider) {
       {v:'gemini-2.5-flash',l:'gemini-2.5-flash'},{v:'gemini-2.5-flash-lite',l:'gemini-2.5-flash-lite'},
       {v:'gemini-3-pro-preview',l:'gemini-3-pro-preview'},{v:'gemini-3-flash-preview',l:'gemini-3-flash-preview'}
     ];
-    const models = provider === 'codex' ? codexModels : (provider === 'gemini' ? geminiModels : claudeModels);
+    const agyModels = [
+      {v:'',l:'Default'},
+      {v:'gemini-3.5-flash-medium',l:'Gemini 3.5 Flash (Medium)'},
+      {v:'gemini-3.5-flash-high',l:'Gemini 3.5 Flash (High)'},
+      {v:'gemini-3.5-flash-low',l:'Gemini 3.5 Flash (Low)'},
+      {v:'gemini-3.1-pro-low',l:'Gemini 3.1 Pro (Low)'},
+      {v:'gemini-3.1-pro-high',l:'Gemini 3.1 Pro (High)'},
+      {v:'claude-sonnet-4-6',l:'Claude Sonnet 4.6 (Thinking)'},
+      {v:'claude-opus-4-6',l:'Claude Opus 4.6 (Thinking)'},
+      {v:'gpt-oss-120b-medium',l:'GPT-OSS 120B (Medium)'}
+    ];
+    const hermesModels = [{v:'',l:'Default (from hermes config)'}];
+    const models = provider === 'codex' ? codexModels
+      : provider === 'gemini' ? geminiModels
+      : provider === 'agy' ? agyModels
+      : provider === 'hermes' ? hermesModels
+      : claudeModels;
     sel.innerHTML = '';
     models.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
     inpWrap.style.display = 'none';
@@ -16535,8 +16615,8 @@ async function toggleYolo(session) {
     if (s) {
       const claudeFlag = '--dangerously-skip-permissions';
       const codexFlag = '--dangerously-bypass-approvals-and-sandbox';
-      const geminiFlag = '--yolo';
-      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(geminiFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
+      const hermesFlag = '--yolo';
+      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(hermesFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
       if (wasYolo) {
         s.flags = stripProviderYoloFlags(s.flags || '');
         s.auto_continue = false;
@@ -22025,6 +22105,8 @@ function _selectProvider(p) {
   _createProvider = p;
   document.getElementById('create-provider-claude').classList.toggle('selected', p === 'claude');
   document.getElementById('create-provider-codex').classList.toggle('selected', p === 'codex');
+  document.getElementById('create-provider-agy').classList.toggle('selected', p === 'agy');
+  document.getElementById('create-provider-hermes').classList.toggle('selected', p === 'hermes');
   document.getElementById('create-provider-gemini').classList.toggle('selected', p === 'gemini');
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
@@ -22036,6 +22118,8 @@ function openCreate() {
   _createProvider = 'claude';
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
+  document.getElementById('create-provider-agy').classList.remove('selected');
+  document.getElementById('create-provider-hermes').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = '';
   document.getElementById('create-template-field').style.display = '';
@@ -38241,7 +38325,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json({"error": "provider must be a string"}, 400)
                     provider_val = body["provider"].strip().lower()
                     if provider_val not in _SESSION_PROVIDERS:
-                        return self._json({"error": "provider must be 'claude', 'codex', or 'gemini'"}, 400)
+                        return self._json({"error": "provider must be one of: claude, codex, agy, hermes, gemini (deprecated)"}, 400)
                     old_provider = cfg.get("CC_PROVIDER", "claude").strip().lower() or "claude"
                     if old_provider not in _SESSION_PROVIDERS:
                         old_provider = "claude"
