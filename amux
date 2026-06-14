@@ -374,7 +374,9 @@ cmd_start() {
       shell_setup="${shell_setup}unset ANTHROPIC_API_KEY; "
     fi
   fi
-  tmux new-session -d -s "$tname" -n "$name" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
+  local cols="${AMUX_TMUX_COLS:-200}"
+  local rows="${AMUX_TMUX_ROWS:-50}"
+  tmux new-session -d -x "$cols" -y "$rows" -s "$tname" -n "$name" -c "$dir" "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
   # Lock the window name so Claude can't overwrite it with escape sequences
   tmux set-option -t "$tname" allow-rename off 2>/dev/null
   tmux set-window-option -t "$tname" automatic-rename off 2>/dev/null

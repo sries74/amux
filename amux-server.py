@@ -3615,91 +3615,143 @@ def _sync_skills_to_commands():
         pass
 
 
-_BUILTIN_SLASH_COMMANDS = [
-    ("/add-dir", "Add a working directory"),
-    ("/agents", "Manage agent configurations"),
-    ("/batch", "Orchestrate large-scale changes in parallel"),
-    ("/clear", "Clear conversation history"),
-    ("/color", "Set prompt bar color"),
-    ("/compact", "Compact conversation history"),
-    ("/config", "Open config panel"),
-    ("/context", "Visualize context usage"),
-    ("/copy", "Copy last response to clipboard"),
-    ("/cost", "Show token usage and cost"),
-    ("/debug", "Enable debug logging"),
-    ("/diff", "Interactive diff viewer"),
-    ("/doctor", "Check installation health"),
-    ("/effort", "Set model effort level"),
-    ("/export", "Export conversation as text"),
-    ("/extra-usage", "Configure extra usage for rate limits"),
-    ("/fast", "Toggle fast mode"),
-    ("/feedback", "Submit feedback or report a bug"),
-    ("/focus", "Toggle focus view"),
-    ("/help", "Show available commands"),
-    ("/hooks", "View hook configurations"),
-    ("/ide", "Manage IDE integrations"),
-    ("/init", "Initialize project CLAUDE.md"),
-    ("/login", "Switch account or log in"),
-    ("/logout", "Log out of current account"),
-    ("/loop", "Run a prompt repeatedly"),
-    ("/mcp", "Manage MCP servers"),
-    ("/memory", "Edit CLAUDE.md memory"),
-    ("/model", "Switch model"),
-    ("/permissions", "View/manage permissions"),
-    ("/plan", "Enter plan mode"),
-    ("/plugin", "Manage plugins"),
-    ("/recap", "Summarize current session"),
-    ("/release-notes", "View changelog"),
-    ("/remote-control", "Enable remote control from claude.ai"),
-    ("/rename", "Rename current session"),
-    ("/resume", "Resume a conversation"),
-    ("/review", "Review a pull request"),
-    ("/rewind", "Rewind conversation to a checkpoint"),
-    ("/sandbox", "Toggle sandbox mode"),
-    ("/schedule", "Create or manage routines"),
-    ("/security-review", "Analyze changes for security issues"),
-    ("/simplify", "Review code for reuse and quality"),
-    ("/skills", "List available skills"),
-    ("/stats", "Visualize usage and session history"),
-    ("/status", "Show session status"),
-    ("/statusline", "Configure status line"),
-    ("/tasks", "List and manage background tasks"),
-    ("/terminal-setup", "Set up terminal integration"),
-    ("/theme", "Change color theme"),
-    ("/ultraplan", "Draft a plan with cloud review"),
-    ("/ultrareview", "Deep multi-agent code review"),
-    ("/usage", "Show plan usage and rate limits"),
-    ("/vim", "Edit prompt in Vim"),
-    ("/voice", "Toggle voice dictation"),
-]
+_BUILTIN_SLASH_COMMANDS = {
+    "claude": [
+        ("/add-dir", "Add a working directory"),
+        ("/agents", "Manage agent configurations"),
+        ("/batch", "Orchestrate large-scale changes in parallel"),
+        ("/clear", "Clear conversation history"),
+        ("/color", "Set prompt bar color"),
+        ("/compact", "Compact conversation history"),
+        ("/config", "Open config panel"),
+        ("/context", "Visualize context usage"),
+        ("/copy", "Copy last response to clipboard"),
+        ("/cost", "Show token usage and cost"),
+        ("/debug", "Enable debug logging"),
+        ("/diff", "Interactive diff viewer"),
+        ("/doctor", "Check installation health"),
+        ("/effort", "Set model effort level"),
+        ("/export", "Export conversation as text"),
+        ("/extra-usage", "Configure extra usage for rate limits"),
+        ("/fast", "Toggle fast mode"),
+        ("/feedback", "Submit feedback or report a bug"),
+        ("/focus", "Toggle focus view"),
+        ("/help", "Show available commands"),
+        ("/hooks", "View hook configurations"),
+        ("/ide", "Manage IDE integrations"),
+        ("/init", "Initialize project CLAUDE.md"),
+        ("/login", "Switch account or log in"),
+        ("/logout", "Log out of current account"),
+        ("/loop", "Run a prompt repeatedly"),
+        ("/mcp", "Manage MCP servers"),
+        ("/memory", "Edit CLAUDE.md memory"),
+        ("/model", "Switch model"),
+        ("/permissions", "View/manage permissions"),
+        ("/plan", "Enter plan mode"),
+        ("/plugin", "Manage plugins"),
+        ("/recap", "Summarize current session"),
+        ("/release-notes", "View changelog"),
+        ("/remote-control", "Enable remote control from claude.ai"),
+        ("/rename", "Rename current session"),
+        ("/resume", "Resume a conversation"),
+        ("/review", "Review a pull request"),
+        ("/rewind", "Rewind conversation to a checkpoint"),
+        ("/sandbox", "Toggle sandbox mode"),
+        ("/schedule", "Create or manage routines"),
+        ("/security-review", "Analyze changes for security issues"),
+        ("/simplify", "Review code for reuse and quality"),
+        ("/skills", "List available skills"),
+        ("/stats", "Visualize usage and session history"),
+        ("/status", "Show session status"),
+        ("/statusline", "Configure status line"),
+        ("/tasks", "List and manage background tasks"),
+        ("/terminal-setup", "Set up terminal integration"),
+        ("/theme", "Change color theme"),
+        ("/ultraplan", "Draft a plan with cloud review"),
+        ("/ultrareview", "Deep multi-agent code review"),
+        ("/usage", "Show plan usage and rate limits"),
+        ("/vim", "Edit prompt in Vim"),
+        ("/voice", "Toggle voice dictation"),
+    ],
+    "hermes": [
+        ("/login", "Authenticate with an inference provider"),
+        ("/logout", "Clear authentication for an inference provider"),
+        ("/auth", "Manage pooled provider credentials"),
+        ("/status", "Show status of all components"),
+        ("/cron", "Cron job management"),
+        ("/webhook", "Manage dynamic webhook subscriptions"),
+        ("/portal", "Set up Nous Portal (login, model pick, Tool Gateway)"),
+        ("/kanban", "Multi-profile collaboration board (tasks, links, comments)"),
+        ("/hooks", "Inspect and manage shell-script hooks"),
+        ("/doctor", "Check configuration and dependencies"),
+        ("/security", "Supply-chain audit (OSV.dev) for venv, plugins, and MCP servers"),
+        ("/dump", "Dump setup summary for support/debugging"),
+        ("/debug", "Debug tools — upload logs and system info for support"),
+        ("/backup", "Back up Hermes home directory to a zip file"),
+        ("/checkpoints", "Inspect / prune / clear ~/.hermes/checkpoints/"),
+        ("/import", "Restore a Hermes backup from a zip file"),
+        ("/config", "View and edit configuration"),
+        ("/pairing", "Manage DM pairing codes for user authorization"),
+        ("/skills", "Search, install, configure, and manage skills"),
+        ("/bundles", "Create, list, and manage skill bundles"),
+        ("/plugins", "Manage plugins — install, update, remove, list"),
+        ("/curator", "Background skill maintenance (curator) — status, run, pause, pin"),
+        ("/memory", "Configure external memory provider"),
+        ("/tools", "Configure which tools are enabled per platform"),
+        ("/computer-use", "Manage the Computer Use (cua-driver) backend (macOS)"),
+        ("/mcp", "Manage MCP servers and run Hermes as an MCP server"),
+        ("/sessions", "Manage session history (list, rename, export, prune, delete)"),
+        ("/insights", "Show usage insights and analytics"),
+        ("/claw", "OpenClaw migration tools"),
+        ("/version", "Show version information"),
+        ("/update", "Update Hermes Agent to the latest version"),
+        ("/uninstall", "Uninstall Hermes Agent"),
+        ("/acp", "Run Hermes Agent as an ACP (Agent Client Protocol) server"),
+        ("/profile", "Manage profiles — multiple isolated Hermes instances"),
+        ("/completion", "Print shell completion script (bash, zsh, or fish)"),
+        ("/dashboard", "Start the web UI dashboard"),
+        ("/desktop", "Build and launch the native desktop app"),
+        ("/logs", "View and filter Hermes log files"),
+        ("/prompt-size", "Show a byte breakdown of the system prompt + tool schemas"),
+    ]
+}
 
 
 def _get_slash_commands():
     import pathlib as _p
-    cmds = [{"cmd": c, "desc": d} for c, d in _BUILTIN_SLASH_COMMANDS]
-    seen = {c for c, _ in _BUILTIN_SLASH_COMMANDS}
-    for d in [_p.Path.home() / ".claude" / "commands", _p.Path(".")  / ".claude" / "commands"]:
-        if not d.is_dir():
-            continue
-        for f in sorted(d.glob("*.md")):
-            name = "/" + f.stem
-            if name in seen:
-                continue
-            seen.add(name)
-            desc = ""
-            try:
-                text = f.read_text()
-                if text.startswith("---"):
-                    fm_end = text.find("---", 3)
-                    if fm_end > 0:
-                        for line in text[3:fm_end].splitlines():
-                            if line.startswith("description:"):
-                                desc = line.split(":", 1)[1].strip()
-                                break
-            except Exception:
-                pass
-            cmds.append({"cmd": name, "desc": desc})
-    return cmds
+    res = {}
+    for prov, builtins in _BUILTIN_SLASH_COMMANDS.items():
+        cmds = [{"cmd": c, "desc": d} for c, d in builtins]
+        seen = {c for c, _ in builtins}
+        if prov == "claude":
+            for d in [_p.Path.home() / ".claude" / "commands", _p.Path(".")  / ".claude" / "commands"]:
+                if not d.is_dir():
+                    continue
+                for f in sorted(d.glob("*.md")):
+                    name = "/" + f.stem
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    desc = ""
+                    try:
+                        text = f.read_text()
+                        if text.startswith("---"):
+                            fm_end = text.find("---", 3)
+                            if fm_end > 0:
+                                for line in text[3:fm_end].splitlines():
+                                    if line.startswith("description:"):
+                                        desc = line.split(":", 1)[1].strip()
+                                        break
+                    except Exception:
+                        pass
+                    cmds.append({"cmd": name, "desc": desc})
+        res[prov] = cmds
+    # Setup alias overrides
+    res["agy"] = res["claude"]
+    res["codex"] = res["claude"]
+    res["gemini"] = res["claude"]
+    res["iterm2"] = res["claude"]
+    return res
 
 
 def _init_db():
@@ -7354,8 +7406,10 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                         _poll_shell_prompt(name, timeout=3.0)
             else:
                 # New tmux session -- start bash shell (not Claude directly)
+                _t_cols = os.environ.get("AMUX_TMUX_COLS", "200")
+                _t_rows = os.environ.get("AMUX_TMUX_ROWS", "50")
                 subprocess.run(
-                    ["tmux", "new-session", "-d", "-s", tmux_sess, "-n", name, "-c", work_dir,
+                    ["tmux", "new-session", "-d", "-x", _t_cols, "-y", _t_rows, "-s", tmux_sess, "-n", name, "-c", work_dir,
                      "-e", "TMUX_SESSION_NAME=" + name,
                      "-e", "AMUX_SESSION=" + name,
                      "-e", ("AMUX_URL=http" if "--no-tls" in sys.argv else "AMUX_URL=https") + "://localhost:8822",
@@ -19489,9 +19543,12 @@ const _ACTION_CHIPS = [
     { id: 'transcripts', label: '\uD83D\uDCBE Transcripts', action: 'special', value: 'showTranscripts', desc: 'Conversation transcripts' },
 ];
 function _getAllChips() {
+  const s = sessions.find(x => x.name === peekSession);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
   return [
     { section: 'Actions', items: _ACTION_CHIPS },
-    { section: 'Slash Commands', items: SLASH_COMMANDS.map(c => ({
+    { section: 'Slash Commands', items: providerCmds.map(c => ({
       id: c.cmd.slice(1), label: c.cmd, action: 'slash', value: c.cmd, desc: c.desc
     })) },
   ];
@@ -20234,7 +20291,10 @@ function slashAcUpdate() {
   el._atItems = null; el._atSel = -1;
   if (!val.startsWith('/')) { el.classList.remove('open'); slashAcItems = []; return; }
   const q = val.toLowerCase();
-  slashAcItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(q));
+  const s = sessions.find(x => x.name === peekSession);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
+  slashAcItems = providerCmds.filter(c => c.cmd.startsWith(q));
   slashAcSelected = -1;
   if (!slashAcItems.length) { el.classList.remove('open'); return; }
   el.innerHTML = slashAcItems.map((c, i) =>
@@ -20466,7 +20526,10 @@ function cardSlashAcUpdate(name) {
   el._atItems = null; el._atSel = -1;
   if (!val.startsWith('/')) { el.classList.remove('open'); _cardAcItems = []; return; }
   const q = val.toLowerCase();
-  _cardAcItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(q));
+  const s = sessions.find(x => x.name === name);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
+  _cardAcItems = providerCmds.filter(c => c.cmd.startsWith(q));
   _cardAcSelected = -1;
   if (!_cardAcItems.length) { el.classList.remove('open'); return; }
   el.innerHTML = _cardAcItems.map((c, i) =>
