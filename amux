@@ -306,7 +306,7 @@ cmd_start() {
   esac
   [[ -d "$dir" ]] || die "directory not found: $dir"
 
-  # Build command. Check CC_PROVIDER to pick codex vs claude.
+  # Build command. Check CC_PROVIDER to pick codex, agy, hermes vs claude.
   local provider="${CC_PROVIDER:-claude}"
   local cmd
   if [[ "$provider" == "codex" ]]; then
@@ -321,11 +321,44 @@ cmd_start() {
     else
       cmd="codex"
     fi
+  elif [[ "$provider" == "agy" || "$provider" == "gemini" ]]; then
+    # Resume from stored agy conversation ID in meta file
+    local meta_file="$CC_SESSIONS/${name}.meta.json"
+    local agy_conv_id=""
+    if [[ -f "$meta_file" ]]; then
+      agy_conv_id=$(python3 -c "import json; print(json.load(open('$meta_file')).get('cc_conversation_id',''))" 2>/dev/null)
+    fi
+    if [[ -n "$agy_conv_id" ]]; then
+      cmd="agy --conversation $agy_conv_id"
+    else
+      # Check if agy has been started before to decide --continue
+      local agy_started=""
+      if [[ -f "$meta_file" ]]; then
+        agy_started=$(python3 -c "import json; print(json.load(open('$meta_file')).get('agy_started',''))" 2>/dev/null)
+      fi
+      if [[ "$agy_started" == "True" || "$agy_started" == "1" ]]; then
+        cmd="agy --continue"
+      else
+        cmd="agy"
+      fi
+    fi
+  elif [[ "$provider" == "hermes" ]]; then
+    # Resume from stored hermes session ID in meta file
+    local meta_file="$CC_SESSIONS/${name}.meta.json"
+    local hermes_sid=""
+    if [[ -f "$meta_file" ]]; then
+      hermes_sid=$(python3 -c "import json; print(json.load(open('$meta_file')).get('hermes_session_id',''))" 2>/dev/null)
+    fi
+    if [[ -n "$hermes_sid" ]]; then
+      cmd="hermes --resume $hermes_sid"
+    else
+      cmd="hermes"
+    fi
   else
     cmd="claude"
   fi
-  # Apply global defaults from defaults.env (skip for codex — Claude flags don't apply)
-  if [[ "$provider" != "codex" && -n "${CC_DEFAULT_FLAGS:-}" ]]; then
+  # Apply global defaults from defaults.env (only for claude — other provider flags differ)
+  if [[ "$provider" == "claude" && -n "${CC_DEFAULT_FLAGS:-}" ]]; then
     local q
     q=$(quote_flags "$CC_DEFAULT_FLAGS") || die "failed to quote CC_DEFAULT_FLAGS"
     [[ -n "$q" ]] && cmd="$cmd $q"
@@ -346,7 +379,7 @@ cmd_start() {
     [[ -n "$q" ]] && cmd="$cmd $q"
   fi
 
-  # Codex-specific defaults
+  # Provider-specific defaults
   if [[ "$provider" == "codex" ]]; then
     [[ "$cmd" == *"--model"* || "$cmd" == *"-m "* ]] || cmd="$cmd --model gpt-5.5"
     [[ "$cmd" == *"--full-auto"* || "$cmd" == *"--dangerously-bypass"* || "$cmd" == *"-a "* ]] || cmd="$cmd -a never"
@@ -358,7 +391,16 @@ cmd_start() {
         [[ -d "$git_root/.git" ]] && cmd="$cmd --add-dir $(printf '%q' "$git_root/.git")"
       fi
     fi
-  else
+  elif [[ "$provider" == "agy" || "$provider" == "gemini" ]]; then
+    if [[ "$cmd" != *"--add-dir"* ]]; then
+      local git_root
+      git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null) || true
+      if [[ -n "$git_root" && "$git_root" != "$dir" ]]; then
+        cmd="$cmd --add-dir $(printf '%q' "$git_root")"
+        [[ -d "$git_root/.git" ]] && cmd="$cmd --add-dir $(printf '%q' "$git_root/.git")"
+      fi
+    fi
+  elif [[ "$provider" == "claude" ]]; then
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
   fi
 

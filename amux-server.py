@@ -3409,34 +3409,126 @@ def _init_claude_config():
         settings_file.write_text(_json.dumps(settings, indent=2))
 
 
-def _auto_trust_dir(work_dir: str):
-    """Pre-trust a directory in ~/.claude.json so Claude doesn't show the folder trust dialog."""
+def _get_skill_description(name: str, content: str) -> str:
+    # Look for frontmatter
+    if content.startswith("---"):
+        fm_end = content.find("---", 3)
+        if fm_end > 0:
+            for line in content[3:fm_end].splitlines():
+                if line.startswith("description:"):
+                    return line.split(":", 1)[1].strip()
+    
+    # Otherwise, extract first non-empty line or header
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("#"):
+            return line.lstrip("#").strip()
+        elif not line.startswith("---"):
+            return line
+            
+    # Fallback to name
+    return f"Custom skill: {name}"
+
+
+def _write_skill_to_dest(provider: str, name: str, content: str):
+    import pathlib as _p
+    
+    desc = _get_skill_description(name, content)
+    if provider in ("agy", "gemini"):
+        if not content.startswith("---"):
+            formatted = f"---\nname: {name}\ndescription: {desc}\n---\n{content}"
+        else:
+            formatted = content
+    else:
+        formatted = content
+        
+    try:
+        if provider == "claude":
+            d = _p.Path.home() / ".claude" / "commands"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+        elif provider in ("agy", "gemini"):
+            for d in [
+                _p.Path.home() / ".gemini" / "antigravity-cli" / "skills",
+                _p.Path.home() / ".gemini" / "skills"
+            ]:
+                try:
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{name}.md").write_text(formatted)
+                except Exception:
+                    pass
+        elif provider == "hermes":
+            d = _p.Path.home() / ".hermes" / "skills"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+        elif provider == "codex":
+            d = _p.Path.home() / ".codex" / "skills"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+    except Exception:
+        pass
+
+
+def _auto_trust_dir(work_dir: str, provider: str = "claude"):
+    """Pre-trust a directory in ~/.claude.json and sync provider-specific skills to global/local folders."""
     import json as _json
     import pathlib as _pathlib
-    claude_json = _pathlib.Path.home() / ".claude.json"
-    try:
-        cfg = _json.loads(claude_json.read_text()) if claude_json.exists() else {}
-    except Exception:
-        cfg = {}
-    projects = cfg.setdefault("projects", {})
-    proj = projects.setdefault(work_dir, {})
-    if not proj.get("hasTrustDialogAccepted"):
-        proj["hasTrustDialogAccepted"] = True
-        proj["hasCompletedProjectOnboarding"] = True
-        claude_json.write_text(_json.dumps(cfg, indent=2))
+    
+    # 1. Auto-trust Claude directory if provider is claude
+    if provider == "claude":
+        claude_json = _pathlib.Path.home() / ".claude.json"
+        try:
+            cfg = _json.loads(claude_json.read_text()) if claude_json.exists() else {}
+        except Exception:
+            cfg = {}
+            
+        projects = cfg.setdefault("projects", {})
+        proj = projects.setdefault(work_dir, {})
+        if not proj.get("hasTrustDialogAccepted"):
+            proj["hasTrustDialogAccepted"] = True
+            proj["hasCompletedProjectOnboarding"] = True
+            try:
+                claude_json.write_text(_json.dumps(cfg, indent=2))
+            except Exception:
+                pass
 
-
-    # ── ~/.claude/commands/ — skills as slash commands ────────────────────────
-    # Sync all skills from SQLite into ~/.claude/commands/ so they're available
-    # as /skill-name slash commands in every Claude session.
+    # 2. Sync all skills from SQLite to both global and local skills paths for this provider
     try:
-        commands_dir = _pathlib.Path.home() / ".claude" / "commands"
-        commands_dir.mkdir(parents=True, exist_ok=True)
         db = get_db()
         rows = db.execute("SELECT name, content FROM skills").fetchall()
         for row in rows:
+            name = row["name"]
+            content = row["content"]
+            
+            # Sync to global paths
+            _write_skill_to_dest(provider, name, content)
+            
+            # Sync to local workspace path
             try:
-                (commands_dir / (row["name"] + ".md")).write_text(row["content"])
+                wd = _pathlib.Path(work_dir)
+                local_dir = None
+                if provider == "claude":
+                    local_dir = wd / ".claude" / "commands"
+                elif provider in ("agy", "gemini"):
+                    local_dir = wd / ".agents" / "skills"
+                elif provider == "hermes":
+                    local_dir = wd / ".hermes" / "skills"
+                elif provider == "codex":
+                    local_dir = wd / ".codex" / "skills"
+                    
+                if local_dir:
+                    local_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    desc = _get_skill_description(name, content)
+                    if provider in ("agy", "gemini"):
+                        if not content.startswith("---"):
+                            formatted_content = f"---\nname: {name}\ndescription: {desc}\n---\n{content}"
+                        else:
+                            formatted_content = content
+                    else:
+                        formatted_content = content
+                        
+                    (local_dir / f"{name}.md").write_text(formatted_content)
             except Exception:
                 pass
     except Exception:
@@ -3599,16 +3691,38 @@ def _auto_trust_codex_dir(work_dir: str):
 
 
 def _sync_skills_to_commands():
-    """Write a single skill to ~/.claude/commands/ after save."""
+    """Sync skills from SQLite to global directories, removing any deleted ones."""
+    import pathlib as _p
     try:
-        import pathlib as _p
-        commands_dir = _p.Path.home() / ".claude" / "commands"
-        commands_dir.mkdir(parents=True, exist_ok=True)
         db = get_db()
         rows = db.execute("SELECT name, content FROM skills").fetchall()
+        active_names = {row["name"] for row in rows}
+        
+        # 1. Write/update active skills
         for row in rows:
+            name = row["name"]
+            content = row["content"]
+            for provider in ("claude", "agy", "gemini", "hermes", "codex"):
+                _write_skill_to_dest(provider, name, content)
+                
+        # 2. Clean up deleted skills from global directories
+        global_dirs = [
+            _p.Path.home() / ".claude" / "commands",
+            _p.Path.home() / ".gemini" / "antigravity-cli" / "skills",
+            _p.Path.home() / ".gemini" / "skills",
+            _p.Path.home() / ".hermes" / "skills",
+            _p.Path.home() / ".codex" / "skills",
+        ]
+        for d in global_dirs:
             try:
-                (commands_dir / (row["name"] + ".md")).write_text(row["content"])
+                if not d.is_dir():
+                    continue
+                for f in d.glob("*.md"):
+                    if f.stem not in active_names:
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
             except Exception:
                 pass
     except Exception:
@@ -3713,6 +3827,32 @@ _BUILTIN_SLASH_COMMANDS = {
         ("/desktop", "Build and launch the native desktop app"),
         ("/logs", "View and filter Hermes log files"),
         ("/prompt-size", "Show a byte breakdown of the system prompt + tool schemas"),
+    ],
+    "agy": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/context", "Manage token usage and checkpoints"),
+        ("/perms", "Adjust agent autonomy levels (request-review vs always-proceed)"),
+        ("/agent", "Dispatch asynchronous subagents"),
+    ],
+    "gemini": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/context", "Manage token usage and checkpoints"),
+        ("/perms", "Adjust agent autonomy levels"),
+        ("/agent", "Dispatch asynchronous subagents"),
+    ],
+    "codex": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/clear", "Clear session history"),
+        ("/context", "Visualize context usage"),
+    ],
+    "iterm2": [
+        ("/help", "Show available commands"),
     ]
 }
 
@@ -3720,11 +3860,70 @@ _BUILTIN_SLASH_COMMANDS = {
 def _get_slash_commands():
     import pathlib as _p
     res = {}
+    
+    # 1. Collect all local session workspace directories
+    session_dirs = []
+    try:
+        sessions_path = _p.Path.home() / ".amux" / "sessions"
+        if sessions_path.exists():
+            for f in sessions_path.glob("*.env"):
+                try:
+                    lines = f.read_text().splitlines()
+                    for line in lines:
+                        if line.startswith("CC_DIR="):
+                            d = line.split("=", 1)[1].strip()
+                            if d:
+                                session_dirs.append(_p.Path(d))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Also add current directory
+    session_dirs.append(_p.Path("."))
+    
+    # Deduplicate directories
+    unique_dirs = []
+    for sd in session_dirs:
+        try:
+            abs_sd = sd.resolve()
+            if abs_sd.is_dir() and abs_sd not in unique_dirs:
+                unique_dirs.append(abs_sd)
+        except Exception:
+            pass
+
+    # 2. Iterate through each provider in _BUILTIN_SLASH_COMMANDS
     for prov, builtins in _BUILTIN_SLASH_COMMANDS.items():
         cmds = [{"cmd": c, "desc": d} for c, d in builtins]
         seen = {c for c, _ in builtins}
+        
+        # Define target skills directories for this provider
+        target_dirs = []
+        
+        # Global paths
         if prov == "claude":
-            for d in [_p.Path.home() / ".claude" / "commands", _p.Path(".")  / ".claude" / "commands"]:
+            target_dirs.append(_p.Path.home() / ".claude" / "commands")
+        elif prov in ("agy", "gemini"):
+            target_dirs.append(_p.Path.home() / ".gemini" / "antigravity-cli" / "skills")
+            target_dirs.append(_p.Path.home() / ".gemini" / "skills")
+        elif prov == "hermes":
+            target_dirs.append(_p.Path.home() / ".hermes" / "skills")
+        elif prov == "codex":
+            target_dirs.append(_p.Path.home() / ".codex" / "skills")
+            
+        # Local paths in session workspaces
+        for sd in unique_dirs:
+            if prov == "claude":
+                target_dirs.append(sd / ".claude" / "commands")
+            elif prov in ("agy", "gemini"):
+                target_dirs.append(sd / ".agents" / "skills")
+            elif prov == "hermes":
+                target_dirs.append(sd / ".hermes" / "skills")
+            elif prov == "codex":
+                target_dirs.append(sd / ".codex" / "skills")
+                
+        # Scan all resolved paths
+        for d in target_dirs:
+            try:
                 if not d.is_dir():
                     continue
                 for f in sorted(d.glob("*.md")):
@@ -3734,7 +3933,7 @@ def _get_slash_commands():
                     seen.add(name)
                     desc = ""
                     try:
-                        text = f.read_text()
+                        text = f.read_text(errors="replace")
                         if text.startswith("---"):
                             fm_end = text.find("---", 3)
                             if fm_end > 0:
@@ -3742,15 +3941,22 @@ def _get_slash_commands():
                                     if line.startswith("description:"):
                                         desc = line.split(":", 1)[1].strip()
                                         break
+                        else:
+                            # Fallback: extract description from headers or first lines
+                            lines = [l.strip() for l in text.splitlines() if l.strip()]
+                            for l in lines:
+                                if l.startswith("#"):
+                                    desc = l.lstrip("#").strip()
+                                    break
+                                elif not l.startswith("---"):
+                                    desc = l
+                                    break
                     except Exception:
                         pass
                     cmds.append({"cmd": name, "desc": desc})
+            except Exception:
+                pass
         res[prov] = cmds
-    # Setup alias overrides
-    res["agy"] = res["claude"]
-    res["codex"] = res["claude"]
-    res["gemini"] = res["claude"]
-    res["iterm2"] = res["claude"]
     return res
 
 
@@ -7069,12 +7275,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
         # Claude Code v2.1.69+ rejects --dangerously-skip-permissions when running as root.
         if os.getuid() == 0 and "--dangerously-skip-permissions" in flags:
             flags = flags.replace("--dangerously-skip-permissions", "").strip()
-        _auto_trust_dir(work_dir)
+        provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
+        _auto_trust_dir(work_dir, provider)
         _ensure_memory(name, work_dir)
 
         # Determine session resume strategy: name-based (new) > UUID (migration) > fresh
         meta = _load_meta(name)
-        provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
         _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
         if not _skip_conv_id and provider == "claude":
             cc_session_name = meta.get("cc_session_name", "")
