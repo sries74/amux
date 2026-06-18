@@ -2326,17 +2326,21 @@ def _claude_ui_visible(clean_output: str) -> bool:
             # Codex model status line: "gpt-X xhigh · ~/path"
             if "·" in ls and ("gpt-" in ls or "o3" in ls or "o4" in ls):
                 return True
-    # Gemini CLI prompt/status. Gemini's UI is also Ink-based and may use
-    # ">" / "›" prompt lines, but only treat those as ready if the banner/model
-    # is visible somewhere in the recent pane.
-    has_gemini = any("gemini" in l.lower() for l in lines[:20] + lines[-12:])
-    if has_gemini:
+    # Gemini / agy (Antigravity) CLI prompt/status. UI uses ">" / "›" prompt
+    # lines; only treat those as active if the banner/model is visible in pane.
+    has_gemini_agy = any(
+        "gemini" in l.lower() or "agy" in l.lower() or "antigravity" in l.lower()
+        for l in lines[:20] + lines[-12:]
+    )
+    if has_gemini_agy:
         for l in lines[-8:]:
             ls = l.strip().lower()
             if ls == ">" or ls.startswith("> ") or ls.startswith("›"):
                 return True
-            if "gemini-" in ls or "yolo" in ls or "approval" in ls:
+            if "gemini-" in ls or "yolo" in ls or "approval" in ls or "dangerously-skip" in ls:
                 return True
+    # Hermes Agent REPL uses the same ❯ prompt character as Claude (already caught
+    # by the dingbat-range spinner check above), so no extra pattern needed.
     return False
 
 
@@ -2418,10 +2422,13 @@ def _snapshot_all_sessions_inner():
             clean = _STRIP_ANSI.sub("", output)
             now = time.time()
             actions = _session_auto_actions.setdefault(name, {})
+            _watchdog_cfg = parse_env_file(f)
+            _watchdog_provider = _watchdog_cfg.get("CC_PROVIDER", "claude").strip().lower()
+            _is_claude_native = _watchdog_provider not in ("codex", "gemini", "agy", "hermes", "iterm2")
 
             # ── 1. Proactive: auto-compact when context is low ──────────────
-            # Skip if the context % appears in /status output (user was just checking)
-            ctx_match = re.search(r'context left until auto-compact[:\s]+(\d+)%', clean, re.IGNORECASE)
+            # (Claude-native only — hermes/agy/codex manage their own context)
+            ctx_match = _is_claude_native and re.search(r'context left until auto-compact[:\s]+(\d+)%', clean, re.IGNORECASE)
             _from_status_cmd = bool(ctx_match and re.search(r'❯\s*/status', clean))
             if ctx_match and not _from_status_cmd:
                 pct = int(ctx_match.group(1))
@@ -2476,7 +2483,9 @@ def _snapshot_all_sessions_inner():
                 actions.pop("img_corrupt_compacted", None)
 
             # ── 2. Reactive: thinking-block corruption → restart + replay ───
-            if ("redacted_thinking" in clean and
+            # (Claude-native only — error is specific to Claude's thinking blocks)
+            if (_is_claude_native and
+                    "redacted_thinking" in clean and
                     "cannot be modified" in clean and
                     now - actions.get("last_restart", 0) > 120):
                 actions["last_restart"] = now
@@ -2495,8 +2504,9 @@ def _snapshot_all_sessions_inner():
 
             # ── 2b. Reactive: session ID already in use → hard-kill + restart ─
             # Claude Code exits with "Session ID ... is already in use" when a
-            # stale process holds the lock.
-            if ("is already in use" in clean and "Session ID" in clean and
+            # stale process holds the lock. (Claude-native only)
+            if (_is_claude_native and
+                    "is already in use" in clean and "Session ID" in clean and
                     now - actions.get("last_restart", 0) > 120):
                 actions["last_restart"] = now
                 wd = _session_work_dir(name)
@@ -3399,34 +3409,126 @@ def _init_claude_config():
         settings_file.write_text(_json.dumps(settings, indent=2))
 
 
-def _auto_trust_dir(work_dir: str):
-    """Pre-trust a directory in ~/.claude.json so Claude doesn't show the folder trust dialog."""
+def _get_skill_description(name: str, content: str) -> str:
+    # Look for frontmatter
+    if content.startswith("---"):
+        fm_end = content.find("---", 3)
+        if fm_end > 0:
+            for line in content[3:fm_end].splitlines():
+                if line.startswith("description:"):
+                    return line.split(":", 1)[1].strip()
+    
+    # Otherwise, extract first non-empty line or header
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    for line in lines:
+        if line.startswith("#"):
+            return line.lstrip("#").strip()
+        elif not line.startswith("---"):
+            return line
+            
+    # Fallback to name
+    return f"Custom skill: {name}"
+
+
+def _write_skill_to_dest(provider: str, name: str, content: str):
+    import pathlib as _p
+    
+    desc = _get_skill_description(name, content)
+    if provider in ("agy", "gemini"):
+        if not content.startswith("---"):
+            formatted = f"---\nname: {name}\ndescription: {desc}\n---\n{content}"
+        else:
+            formatted = content
+    else:
+        formatted = content
+        
+    try:
+        if provider == "claude":
+            d = _p.Path.home() / ".claude" / "commands"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+        elif provider in ("agy", "gemini"):
+            for d in [
+                _p.Path.home() / ".gemini" / "antigravity-cli" / "skills",
+                _p.Path.home() / ".gemini" / "skills"
+            ]:
+                try:
+                    d.mkdir(parents=True, exist_ok=True)
+                    (d / f"{name}.md").write_text(formatted)
+                except Exception:
+                    pass
+        elif provider == "hermes":
+            d = _p.Path.home() / ".hermes" / "skills"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+        elif provider == "codex":
+            d = _p.Path.home() / ".codex" / "skills"
+            d.mkdir(parents=True, exist_ok=True)
+            (d / f"{name}.md").write_text(formatted)
+    except Exception:
+        pass
+
+
+def _auto_trust_dir(work_dir: str, provider: str = "claude"):
+    """Pre-trust a directory in ~/.claude.json and sync provider-specific skills to global/local folders."""
     import json as _json
     import pathlib as _pathlib
-    claude_json = _pathlib.Path.home() / ".claude.json"
-    try:
-        cfg = _json.loads(claude_json.read_text()) if claude_json.exists() else {}
-    except Exception:
-        cfg = {}
-    projects = cfg.setdefault("projects", {})
-    proj = projects.setdefault(work_dir, {})
-    if not proj.get("hasTrustDialogAccepted"):
-        proj["hasTrustDialogAccepted"] = True
-        proj["hasCompletedProjectOnboarding"] = True
-        claude_json.write_text(_json.dumps(cfg, indent=2))
+    
+    # 1. Auto-trust Claude directory if provider is claude
+    if provider == "claude":
+        claude_json = _pathlib.Path.home() / ".claude.json"
+        try:
+            cfg = _json.loads(claude_json.read_text()) if claude_json.exists() else {}
+        except Exception:
+            cfg = {}
+            
+        projects = cfg.setdefault("projects", {})
+        proj = projects.setdefault(work_dir, {})
+        if not proj.get("hasTrustDialogAccepted"):
+            proj["hasTrustDialogAccepted"] = True
+            proj["hasCompletedProjectOnboarding"] = True
+            try:
+                claude_json.write_text(_json.dumps(cfg, indent=2))
+            except Exception:
+                pass
 
-
-    # ── ~/.claude/commands/ — skills as slash commands ────────────────────────
-    # Sync all skills from SQLite into ~/.claude/commands/ so they're available
-    # as /skill-name slash commands in every Claude session.
+    # 2. Sync all skills from SQLite to both global and local skills paths for this provider
     try:
-        commands_dir = _pathlib.Path.home() / ".claude" / "commands"
-        commands_dir.mkdir(parents=True, exist_ok=True)
         db = get_db()
         rows = db.execute("SELECT name, content FROM skills").fetchall()
         for row in rows:
+            name = row["name"]
+            content = row["content"]
+            
+            # Sync to global paths
+            _write_skill_to_dest(provider, name, content)
+            
+            # Sync to local workspace path
             try:
-                (commands_dir / (row["name"] + ".md")).write_text(row["content"])
+                wd = _pathlib.Path(work_dir)
+                local_dir = None
+                if provider == "claude":
+                    local_dir = wd / ".claude" / "commands"
+                elif provider in ("agy", "gemini"):
+                    local_dir = wd / ".agents" / "skills"
+                elif provider == "hermes":
+                    local_dir = wd / ".hermes" / "skills"
+                elif provider == "codex":
+                    local_dir = wd / ".codex" / "skills"
+                    
+                if local_dir:
+                    local_dir.mkdir(parents=True, exist_ok=True)
+                    
+                    desc = _get_skill_description(name, content)
+                    if provider in ("agy", "gemini"):
+                        if not content.startswith("---"):
+                            formatted_content = f"---\nname: {name}\ndescription: {desc}\n---\n{content}"
+                        else:
+                            formatted_content = content
+                    else:
+                        formatted_content = content
+                        
+                    (local_dir / f"{name}.md").write_text(formatted_content)
             except Exception:
                 pass
     except Exception:
@@ -3589,107 +3691,273 @@ def _auto_trust_codex_dir(work_dir: str):
 
 
 def _sync_skills_to_commands():
-    """Write a single skill to ~/.claude/commands/ after save."""
+    """Sync skills from SQLite to global directories, removing any deleted ones."""
+    import pathlib as _p
     try:
-        import pathlib as _p
-        commands_dir = _p.Path.home() / ".claude" / "commands"
-        commands_dir.mkdir(parents=True, exist_ok=True)
         db = get_db()
         rows = db.execute("SELECT name, content FROM skills").fetchall()
+        active_names = {row["name"] for row in rows}
+        
+        # 1. Write/update active skills
         for row in rows:
+            name = row["name"]
+            content = row["content"]
+            for provider in ("claude", "agy", "gemini", "hermes", "codex"):
+                _write_skill_to_dest(provider, name, content)
+                
+        # 2. Clean up deleted skills from global directories
+        global_dirs = [
+            _p.Path.home() / ".claude" / "commands",
+            _p.Path.home() / ".gemini" / "antigravity-cli" / "skills",
+            _p.Path.home() / ".gemini" / "skills",
+            _p.Path.home() / ".hermes" / "skills",
+            _p.Path.home() / ".codex" / "skills",
+        ]
+        for d in global_dirs:
             try:
-                (commands_dir / (row["name"] + ".md")).write_text(row["content"])
+                if not d.is_dir():
+                    continue
+                for f in d.glob("*.md"):
+                    if f.stem not in active_names:
+                        try:
+                            f.unlink()
+                        except Exception:
+                            pass
             except Exception:
                 pass
     except Exception:
         pass
 
 
-_BUILTIN_SLASH_COMMANDS = [
-    ("/add-dir", "Add a working directory"),
-    ("/agents", "Manage agent configurations"),
-    ("/batch", "Orchestrate large-scale changes in parallel"),
-    ("/clear", "Clear conversation history"),
-    ("/color", "Set prompt bar color"),
-    ("/compact", "Compact conversation history"),
-    ("/config", "Open config panel"),
-    ("/context", "Visualize context usage"),
-    ("/copy", "Copy last response to clipboard"),
-    ("/cost", "Show token usage and cost"),
-    ("/debug", "Enable debug logging"),
-    ("/diff", "Interactive diff viewer"),
-    ("/doctor", "Check installation health"),
-    ("/effort", "Set model effort level"),
-    ("/export", "Export conversation as text"),
-    ("/extra-usage", "Configure extra usage for rate limits"),
-    ("/fast", "Toggle fast mode"),
-    ("/feedback", "Submit feedback or report a bug"),
-    ("/focus", "Toggle focus view"),
-    ("/help", "Show available commands"),
-    ("/hooks", "View hook configurations"),
-    ("/ide", "Manage IDE integrations"),
-    ("/init", "Initialize project CLAUDE.md"),
-    ("/login", "Switch account or log in"),
-    ("/logout", "Log out of current account"),
-    ("/loop", "Run a prompt repeatedly"),
-    ("/mcp", "Manage MCP servers"),
-    ("/memory", "Edit CLAUDE.md memory"),
-    ("/model", "Switch model"),
-    ("/permissions", "View/manage permissions"),
-    ("/plan", "Enter plan mode"),
-    ("/plugin", "Manage plugins"),
-    ("/recap", "Summarize current session"),
-    ("/release-notes", "View changelog"),
-    ("/remote-control", "Enable remote control from claude.ai"),
-    ("/rename", "Rename current session"),
-    ("/resume", "Resume a conversation"),
-    ("/review", "Review a pull request"),
-    ("/rewind", "Rewind conversation to a checkpoint"),
-    ("/sandbox", "Toggle sandbox mode"),
-    ("/schedule", "Create or manage routines"),
-    ("/security-review", "Analyze changes for security issues"),
-    ("/simplify", "Review code for reuse and quality"),
-    ("/skills", "List available skills"),
-    ("/stats", "Visualize usage and session history"),
-    ("/status", "Show session status"),
-    ("/statusline", "Configure status line"),
-    ("/tasks", "List and manage background tasks"),
-    ("/terminal-setup", "Set up terminal integration"),
-    ("/theme", "Change color theme"),
-    ("/ultraplan", "Draft a plan with cloud review"),
-    ("/ultrareview", "Deep multi-agent code review"),
-    ("/usage", "Show plan usage and rate limits"),
-    ("/vim", "Edit prompt in Vim"),
-    ("/voice", "Toggle voice dictation"),
-]
+_BUILTIN_SLASH_COMMANDS = {
+    "claude": [
+        ("/add-dir", "Add a working directory"),
+        ("/agents", "Manage agent configurations"),
+        ("/batch", "Orchestrate large-scale changes in parallel"),
+        ("/clear", "Clear conversation history"),
+        ("/color", "Set prompt bar color"),
+        ("/compact", "Compact conversation history"),
+        ("/config", "Open config panel"),
+        ("/context", "Visualize context usage"),
+        ("/copy", "Copy last response to clipboard"),
+        ("/cost", "Show token usage and cost"),
+        ("/debug", "Enable debug logging"),
+        ("/diff", "Interactive diff viewer"),
+        ("/doctor", "Check installation health"),
+        ("/effort", "Set model effort level"),
+        ("/export", "Export conversation as text"),
+        ("/extra-usage", "Configure extra usage for rate limits"),
+        ("/fast", "Toggle fast mode"),
+        ("/feedback", "Submit feedback or report a bug"),
+        ("/focus", "Toggle focus view"),
+        ("/help", "Show available commands"),
+        ("/hooks", "View hook configurations"),
+        ("/ide", "Manage IDE integrations"),
+        ("/init", "Initialize project CLAUDE.md"),
+        ("/login", "Switch account or log in"),
+        ("/logout", "Log out of current account"),
+        ("/loop", "Run a prompt repeatedly"),
+        ("/mcp", "Manage MCP servers"),
+        ("/memory", "Edit CLAUDE.md memory"),
+        ("/model", "Switch model"),
+        ("/permissions", "View/manage permissions"),
+        ("/plan", "Enter plan mode"),
+        ("/plugin", "Manage plugins"),
+        ("/recap", "Summarize current session"),
+        ("/release-notes", "View changelog"),
+        ("/remote-control", "Enable remote control from claude.ai"),
+        ("/rename", "Rename current session"),
+        ("/resume", "Resume a conversation"),
+        ("/review", "Review a pull request"),
+        ("/rewind", "Rewind conversation to a checkpoint"),
+        ("/sandbox", "Toggle sandbox mode"),
+        ("/schedule", "Create or manage routines"),
+        ("/security-review", "Analyze changes for security issues"),
+        ("/simplify", "Review code for reuse and quality"),
+        ("/skills", "List available skills"),
+        ("/stats", "Visualize usage and session history"),
+        ("/status", "Show session status"),
+        ("/statusline", "Configure status line"),
+        ("/tasks", "List and manage background tasks"),
+        ("/terminal-setup", "Set up terminal integration"),
+        ("/theme", "Change color theme"),
+        ("/ultraplan", "Draft a plan with cloud review"),
+        ("/ultrareview", "Deep multi-agent code review"),
+        ("/usage", "Show plan usage and rate limits"),
+        ("/vim", "Edit prompt in Vim"),
+        ("/voice", "Toggle voice dictation"),
+    ],
+    "hermes": [
+        ("/login", "Authenticate with an inference provider"),
+        ("/logout", "Clear authentication for an inference provider"),
+        ("/auth", "Manage pooled provider credentials"),
+        ("/status", "Show status of all components"),
+        ("/cron", "Cron job management"),
+        ("/webhook", "Manage dynamic webhook subscriptions"),
+        ("/portal", "Set up Nous Portal (login, model pick, Tool Gateway)"),
+        ("/kanban", "Multi-profile collaboration board (tasks, links, comments)"),
+        ("/hooks", "Inspect and manage shell-script hooks"),
+        ("/doctor", "Check configuration and dependencies"),
+        ("/security", "Supply-chain audit (OSV.dev) for venv, plugins, and MCP servers"),
+        ("/dump", "Dump setup summary for support/debugging"),
+        ("/debug", "Debug tools — upload logs and system info for support"),
+        ("/backup", "Back up Hermes home directory to a zip file"),
+        ("/checkpoints", "Inspect / prune / clear ~/.hermes/checkpoints/"),
+        ("/import", "Restore a Hermes backup from a zip file"),
+        ("/config", "View and edit configuration"),
+        ("/pairing", "Manage DM pairing codes for user authorization"),
+        ("/skills", "Search, install, configure, and manage skills"),
+        ("/bundles", "Create, list, and manage skill bundles"),
+        ("/plugins", "Manage plugins — install, update, remove, list"),
+        ("/curator", "Background skill maintenance (curator) — status, run, pause, pin"),
+        ("/memory", "Configure external memory provider"),
+        ("/tools", "Configure which tools are enabled per platform"),
+        ("/computer-use", "Manage the Computer Use (cua-driver) backend (macOS)"),
+        ("/mcp", "Manage MCP servers and run Hermes as an MCP server"),
+        ("/sessions", "Manage session history (list, rename, export, prune, delete)"),
+        ("/insights", "Show usage insights and analytics"),
+        ("/claw", "OpenClaw migration tools"),
+        ("/version", "Show version information"),
+        ("/update", "Update Hermes Agent to the latest version"),
+        ("/uninstall", "Uninstall Hermes Agent"),
+        ("/acp", "Run Hermes Agent as an ACP (Agent Client Protocol) server"),
+        ("/profile", "Manage profiles — multiple isolated Hermes instances"),
+        ("/completion", "Print shell completion script (bash, zsh, or fish)"),
+        ("/dashboard", "Start the web UI dashboard"),
+        ("/desktop", "Build and launch the native desktop app"),
+        ("/logs", "View and filter Hermes log files"),
+        ("/prompt-size", "Show a byte breakdown of the system prompt + tool schemas"),
+    ],
+    "agy": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/context", "Manage token usage and checkpoints"),
+        ("/perms", "Adjust agent autonomy levels (request-review vs always-proceed)"),
+        ("/agent", "Dispatch asynchronous subagents"),
+    ],
+    "gemini": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/context", "Manage token usage and checkpoints"),
+        ("/perms", "Adjust agent autonomy levels"),
+        ("/agent", "Dispatch asynchronous subagents"),
+    ],
+    "codex": [
+        ("/help", "Show available commands"),
+        ("/model", "Switch model"),
+        ("/skills", "List available skills"),
+        ("/clear", "Clear session history"),
+        ("/context", "Visualize context usage"),
+    ],
+    "iterm2": [
+        ("/help", "Show available commands"),
+    ]
+}
 
 
 def _get_slash_commands():
     import pathlib as _p
-    cmds = [{"cmd": c, "desc": d} for c, d in _BUILTIN_SLASH_COMMANDS]
-    seen = {c for c, _ in _BUILTIN_SLASH_COMMANDS}
-    for d in [_p.Path.home() / ".claude" / "commands", _p.Path(".")  / ".claude" / "commands"]:
-        if not d.is_dir():
-            continue
-        for f in sorted(d.glob("*.md")):
-            name = "/" + f.stem
-            if name in seen:
-                continue
-            seen.add(name)
-            desc = ""
+    res = {}
+    
+    # 1. Collect all local session workspace directories
+    session_dirs = []
+    try:
+        sessions_path = _p.Path.home() / ".amux" / "sessions"
+        if sessions_path.exists():
+            for f in sessions_path.glob("*.env"):
+                try:
+                    lines = f.read_text().splitlines()
+                    for line in lines:
+                        if line.startswith("CC_DIR="):
+                            d = line.split("=", 1)[1].strip()
+                            if d:
+                                session_dirs.append(_p.Path(d))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    # Also add current directory
+    session_dirs.append(_p.Path("."))
+    
+    # Deduplicate directories
+    unique_dirs = []
+    for sd in session_dirs:
+        try:
+            abs_sd = sd.resolve()
+            if abs_sd.is_dir() and abs_sd not in unique_dirs:
+                unique_dirs.append(abs_sd)
+        except Exception:
+            pass
+
+    # 2. Iterate through each provider in _BUILTIN_SLASH_COMMANDS
+    for prov, builtins in _BUILTIN_SLASH_COMMANDS.items():
+        cmds = [{"cmd": c, "desc": d} for c, d in builtins]
+        seen = {c for c, _ in builtins}
+        
+        # Define target skills directories for this provider
+        target_dirs = []
+        
+        # Global paths
+        if prov == "claude":
+            target_dirs.append(_p.Path.home() / ".claude" / "commands")
+        elif prov in ("agy", "gemini"):
+            target_dirs.append(_p.Path.home() / ".gemini" / "antigravity-cli" / "skills")
+            target_dirs.append(_p.Path.home() / ".gemini" / "skills")
+        elif prov == "hermes":
+            target_dirs.append(_p.Path.home() / ".hermes" / "skills")
+        elif prov == "codex":
+            target_dirs.append(_p.Path.home() / ".codex" / "skills")
+            
+        # Local paths in session workspaces
+        for sd in unique_dirs:
+            if prov == "claude":
+                target_dirs.append(sd / ".claude" / "commands")
+            elif prov in ("agy", "gemini"):
+                target_dirs.append(sd / ".agents" / "skills")
+            elif prov == "hermes":
+                target_dirs.append(sd / ".hermes" / "skills")
+            elif prov == "codex":
+                target_dirs.append(sd / ".codex" / "skills")
+                
+        # Scan all resolved paths
+        for d in target_dirs:
             try:
-                text = f.read_text()
-                if text.startswith("---"):
-                    fm_end = text.find("---", 3)
-                    if fm_end > 0:
-                        for line in text[3:fm_end].splitlines():
-                            if line.startswith("description:"):
-                                desc = line.split(":", 1)[1].strip()
-                                break
+                if not d.is_dir():
+                    continue
+                for f in sorted(d.glob("*.md")):
+                    name = "/" + f.stem
+                    if name in seen:
+                        continue
+                    seen.add(name)
+                    desc = ""
+                    try:
+                        text = f.read_text(errors="replace")
+                        if text.startswith("---"):
+                            fm_end = text.find("---", 3)
+                            if fm_end > 0:
+                                for line in text[3:fm_end].splitlines():
+                                    if line.startswith("description:"):
+                                        desc = line.split(":", 1)[1].strip()
+                                        break
+                        else:
+                            # Fallback: extract description from headers or first lines
+                            lines = [l.strip() for l in text.splitlines() if l.strip()]
+                            for l in lines:
+                                if l.startswith("#"):
+                                    desc = l.lstrip("#").strip()
+                                    break
+                                elif not l.startswith("---"):
+                                    desc = l
+                                    break
+                    except Exception:
+                        pass
+                    cmds.append({"cmd": name, "desc": desc})
             except Exception:
                 pass
-            cmds.append({"cmd": name, "desc": desc})
-    return cmds
+        res[prov] = cmds
+    return res
 
 
 def _init_db():
@@ -5877,7 +6145,7 @@ def list_sessions() -> list:
         raw_dir = cfg.get("CC_DIR", "")
         resolved_dir = str(Path(raw_dir).expanduser().resolve()) if raw_dir else ""
         provider = cfg.get("CC_PROVIDER", "claude")
-        if provider in ("codex", "gemini"):
+        if provider in ("codex", "gemini", "agy", "hermes"):
             active_model = _extract_model_from_flags(cfg.get("CC_FLAGS", "")) or _default_model_for_provider(provider)
         else:
             active_model = detect_active_model(raw_dir, meta.get("cc_conversation_id", ""))
@@ -6637,7 +6905,7 @@ def _validate_model_name(value) -> tuple[bool, str, str]:
     return True, normalized, ""
 
 
-_SESSION_PROVIDERS = ("claude", "codex", "gemini", "iterm2")
+_SESSION_PROVIDERS = ("claude", "codex", "gemini", "agy", "hermes", "iterm2")
 
 
 _PROVIDER_YOLO_FLAGS = (
@@ -6652,6 +6920,8 @@ def _default_model_for_provider(provider: str) -> str:
         return "gpt-5.5"
     if provider == "gemini":
         return "auto"
+    if provider in ("agy", "hermes"):
+        return ""   # these tools use their own configured defaults
     return _get_default_model()
 
 
@@ -6659,7 +6929,9 @@ def _provider_label(provider: str) -> str:
     return {
         "claude": "Claude Code",
         "codex": "Codex",
-        "gemini": "Gemini",
+        "gemini": "Gemini (deprecated)",
+        "agy": "Antigravity",
+        "hermes": "Hermes Agent",
         "iterm2": "iTerm2",
     }.get(provider, provider or "Claude Code")
 
@@ -6667,9 +6939,9 @@ def _provider_label(provider: str) -> str:
 def _provider_yolo_flag(provider: str) -> str:
     if provider == "codex":
         return "--dangerously-bypass-approvals-and-sandbox"
-    if provider == "gemini":
+    if provider in ("gemini", "hermes"):
         return "--yolo"
-    return "--dangerously-skip-permissions"
+    return "--dangerously-skip-permissions"  # claude + agy
 
 
 def _strip_provider_yolo_flags(flags: str) -> str:
@@ -7003,12 +7275,12 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
         # Claude Code v2.1.69+ rejects --dangerously-skip-permissions when running as root.
         if os.getuid() == 0 and "--dangerously-skip-permissions" in flags:
             flags = flags.replace("--dangerously-skip-permissions", "").strip()
-        _auto_trust_dir(work_dir)
+        provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
+        _auto_trust_dir(work_dir, provider)
         _ensure_memory(name, work_dir)
 
         # Determine session resume strategy: name-based (new) > UUID (migration) > fresh
         meta = _load_meta(name)
-        provider = cfg.get("CC_PROVIDER", "claude").strip().lower()
         _uuid_re = re.compile(r'^[0-9a-fA-F-]{36}$')
         if not _skip_conv_id and provider == "claude":
             cc_session_name = meta.get("cc_session_name", "")
@@ -7138,54 +7410,71 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
             else:
                 cmd = f"codex{_codex_opts}"
                 print(f"[start] {name}: codex fresh start")
-        elif provider == "gemini":
-            gemini_session_id = meta.get("gemini_session_id", "")
-            _gemini_flags = flags or ""
-            _gemini_yolo = False
-            if (
-                any(f in _gemini_flags for f in _PROVIDER_YOLO_FLAGS)
-                or "--approval-mode=yolo" in _gemini_flags
-                or "--approval-mode yolo" in _gemini_flags
-            ):
-                _gemini_yolo = True
-                _gemini_flags = _strip_provider_yolo_flags(_gemini_flags)
-            _gemini_opts = ""
-            if _gemini_flags:
-                _gemini_opts += f" {_shell_quote_flags(_gemini_flags)}"
+        elif provider in ("gemini", "agy"):
+            # "gemini" is a deprecated alias — both run via the agy binary
+            _agy_started = meta.get("agy_started", False)
+            _agy_conv_id = meta.get("agy_conversation_id", "")
+            _agy_flags = flags or ""
+            _agy_yolo = any(f in _agy_flags for f in _PROVIDER_YOLO_FLAGS)
+            if _agy_yolo:
+                _agy_flags = _strip_provider_yolo_flags(_agy_flags)
+            _agy_opts = ""
+            if _agy_flags:
+                _agy_opts += f" {_shell_quote_flags(_agy_flags)}"
             if extra_flags:
-                _gemini_opts += f" {_shell_quote_flags(extra_flags)}"
-            if "--model" not in _gemini_opts and "-m " not in _gemini_opts:
-                _gemini_opts += " --model auto"
-            if _gemini_yolo and "--yolo" not in _gemini_opts and "--approval-mode" not in _gemini_opts:
-                _gemini_opts += " --yolo"
-            if "--skip-trust" not in _gemini_opts:
-                _gemini_opts += " --skip-trust"
-            include_dirs = [str(CC_LOGS)]
+                _agy_opts += f" {_shell_quote_flags(extra_flags)}"
+            if _agy_yolo and "--dangerously-skip-permissions" not in _agy_opts:
+                _agy_opts += " --dangerously-skip-permissions"
+            # Add directories to workspace (agy uses --add-dir, same as codex)
+            _agy_dirs = [str(CC_LOGS)]
             try:
                 _gr = subprocess.run(
                     ["git", "-C", work_dir, "rev-parse", "--show-toplevel"],
                     capture_output=True, text=True, timeout=5,
                 )
                 if _gr.returncode == 0:
-                    git_root = _gr.stdout.strip()
-                    if git_root and git_root != work_dir:
-                        include_dirs.append(git_root)
-                    git_dir = os.path.join(git_root, ".git")
-                    if os.path.isdir(git_dir):
-                        include_dirs.append(git_dir)
+                    _git_root = _gr.stdout.strip()
+                    if _git_root and _git_root != work_dir:
+                        _agy_dirs.append(_git_root)
+                    _git_dir = os.path.join(_git_root, ".git")
+                    if os.path.isdir(_git_dir):
+                        _agy_dirs.append(_git_dir)
             except Exception:
                 pass
-            for include_dir in dict.fromkeys(include_dirs):
-                if include_dir and include_dir not in _gemini_opts:
-                    _gemini_opts += f" --include-directories {shlex.quote(include_dir)}"
-            if gemini_session_id:
-                cmd = f"gemini{_gemini_opts} --resume {shlex.quote(gemini_session_id)}"
-                print(f"[start] {name}: gemini resume {gemini_session_id}")
+            for _agy_dir in dict.fromkeys(_agy_dirs):
+                if _agy_dir and _agy_dir not in _agy_opts:
+                    _agy_opts += f" --add-dir {shlex.quote(_agy_dir)}"
+            if _agy_conv_id:
+                cmd = f"agy{_agy_opts} --conversation {shlex.quote(_agy_conv_id)}"
+                print(f"[start] {name}: agy resume conversation {_agy_conv_id}")
+            elif _agy_started:
+                # Resume the most recent agy conversation (no stored ID available)
+                cmd = f"agy{_agy_opts} --continue"
+                print(f"[start] {name}: agy --continue (resume most recent)")
             else:
-                gemini_session_id = str(uuid.uuid4())
-                meta["gemini_session_id"] = gemini_session_id
-                cmd = f"gemini{_gemini_opts} --session-id {shlex.quote(gemini_session_id)}"
-                print(f"[start] {name}: gemini fresh start {gemini_session_id}")
+                meta["agy_started"] = True
+                _save_meta(name, meta)
+                cmd = f"agy{_agy_opts}"
+                print(f"[start] {name}: agy fresh start")
+        elif provider == "hermes":
+            _hermes_session_id = meta.get("hermes_session_id", "")
+            _hermes_flags = flags or ""
+            _hermes_yolo = any(f in _hermes_flags for f in _PROVIDER_YOLO_FLAGS)
+            if _hermes_yolo:
+                _hermes_flags = _strip_provider_yolo_flags(_hermes_flags)
+            _hermes_opts = ""
+            if _hermes_flags:
+                _hermes_opts += f" {_shell_quote_flags(_hermes_flags)}"
+            if extra_flags:
+                _hermes_opts += f" {_shell_quote_flags(extra_flags)}"
+            if _hermes_yolo and "--yolo" not in _hermes_opts:
+                _hermes_opts += " --yolo"
+            if _hermes_session_id:
+                cmd = f"hermes{_hermes_opts} --resume {shlex.quote(_hermes_session_id)}"
+                print(f"[start] {name}: hermes resume {_hermes_session_id}")
+            else:
+                cmd = f"hermes{_hermes_opts}"
+                print(f"[start] {name}: hermes fresh start")
         else:
             cmd = "claude"
             if default_flags:
@@ -7208,28 +7497,29 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                 cmd += " --model sonnet"
         try:
             tmux_sess = tmux_name(name)
-            # Build shell setup string — skip Claude env cleanup for codex
+            # Build shell setup string — skip Claude env cleanup for codex/agy
             _has_oauth = False
-            if provider in ("codex", "gemini"):
+            if provider in ("codex", "gemini", "agy"):
                 shell_rc = ""
             else:
                 shell_rc = "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
-                try:
-                    import json as _j2
-                    _cj = Path.home() / ".claude.json"
-                    if _cj.exists():
-                        _has_oauth = bool(_j2.loads(_cj.read_text()).get("oauthAccount"))
-                except Exception:
-                    pass
-                if _has_oauth:
-                    shell_rc += "unset ANTHROPIC_API_KEY; "
+                if provider == "claude":
+                    try:
+                        import json as _j2
+                        _cj = Path.home() / ".claude.json"
+                        if _cj.exists():
+                            _has_oauth = bool(_j2.loads(_cj.read_text()).get("oauthAccount"))
+                    except Exception:
+                        pass
+                    if _has_oauth:
+                        shell_rc += "unset ANTHROPIC_API_KEY; "
             for rc in [Path.home() / ".zprofile", Path.home() / ".bash_profile", Path.home() / ".profile"]:
                 if rc.exists():
                     shell_rc += f"source {rc} 2>/dev/null; cd {shlex.quote(work_dir)}; "
                     break
             else:
                 shell_rc += f"cd {shlex.quote(work_dir)}; "
-            if provider not in ("codex", "gemini") and _has_oauth:
+            if provider == "claude" and _has_oauth:
                 shell_rc += "unset ANTHROPIC_API_KEY; "
             # Forward select env vars into the tmux session.
             _env_args = []
@@ -7322,8 +7612,10 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                         _poll_shell_prompt(name, timeout=3.0)
             else:
                 # New tmux session -- start bash shell (not Claude directly)
+                _t_cols = os.environ.get("AMUX_TMUX_COLS", "200")
+                _t_rows = os.environ.get("AMUX_TMUX_ROWS", "50")
                 subprocess.run(
-                    ["tmux", "new-session", "-d", "-s", tmux_sess, "-n", name, "-c", work_dir,
+                    ["tmux", "new-session", "-d", "-x", _t_cols, "-y", _t_rows, "-s", tmux_sess, "-n", name, "-c", work_dir,
                      "-e", "TMUX_SESSION_NAME=" + name,
                      "-e", "AMUX_SESSION=" + name,
                      "-e", ("AMUX_URL=http" if "--no-tls" in sys.argv else "AMUX_URL=https") + "://localhost:8822",
@@ -7355,8 +7647,8 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                                capture_output=True, timeout=5)
                 _poll_shell_prompt(name, timeout=3.0)  # let profile source complete
     
-            # Ensure ANTHROPIC_API_KEY is unset when OAuth is available
-            if _has_oauth and provider not in ("codex", "gemini"):
+            # Ensure ANTHROPIC_API_KEY is unset when OAuth is available (claude only)
+            if _has_oauth and provider == "claude":
                 subprocess.run(["tmux", "send-keys", "-t", tmux_target(name), "-l",
                                 "unset ANTHROPIC_API_KEY"],
                                capture_output=True, timeout=5)
@@ -7499,6 +7791,31 @@ def start_session(name: str, extra_flags: str = "", _skip_conv_id: bool = False)
                         _save_meta(sname, m)
                         print(f"[start] {sname}: captured codex session {sid}")
                 threading.Thread(target=_capture_codex_id, daemon=True).start()
+            # For hermes: capture the new session ID after startup so future restarts
+            # can use --resume <id> to land in the exact same conversation.
+            if provider == "hermes" and not meta.get("hermes_session_id"):
+                def _capture_hermes_id(sname=name):
+                    time.sleep(5)
+                    try:
+                        r_h = subprocess.run(
+                            ["hermes", "sessions", "list", "--limit", "1"],
+                            capture_output=True, text=True, timeout=10,
+                        )
+                        if r_h.returncode == 0:
+                            for _hl in r_h.stdout.splitlines():
+                                if _hl.startswith("─") or _hl.startswith("Title"):
+                                    continue
+                                _hid = _hl.strip().split()[-1] if _hl.strip() else ""
+                                if _hid and not _hid.startswith("─"):
+                                    m = _load_meta(sname)
+                                    if not m.get("hermes_session_id"):
+                                        m["hermes_session_id"] = _hid
+                                        _save_meta(sname, m)
+                                        print(f"[start] {sname}: captured hermes session {_hid}")
+                                    break
+                    except Exception as _e:
+                        print(f"[start] {sname}: hermes session ID capture failed: {_e}")
+                threading.Thread(target=_capture_hermes_id, daemon=True).start()
             _save_meta(name, meta)
             if pending_log_reload:
                 _start_pending_log_reload_thread(name, pending_log_reload_reason)
@@ -13617,7 +13934,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <div style="display:flex;gap:6px;">
         <button type="button" id="create-provider-claude" class="btn provider-btn selected" onclick="_selectProvider('claude')">Claude Code</button>
         <button type="button" id="create-provider-codex" class="btn provider-btn" onclick="_selectProvider('codex')">Codex</button>
-        <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')">Gemini</button>
+        <button type="button" id="create-provider-agy" class="btn provider-btn" onclick="_selectProvider('agy')">Antigravity</button>
+        <button type="button" id="create-provider-hermes" class="btn provider-btn" onclick="_selectProvider('hermes')">Hermes</button>
+        <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')" title="Deprecated — use Antigravity instead" style="opacity:0.5">Gemini</button>
       </div>
     </div>
     <div class="field-group">
@@ -15400,18 +15719,21 @@ function flagValue(flags, flag) {
 function providerLabel(provider) {
   if (provider === 'codex') return 'Codex';
   if (provider === 'gemini') return 'Gemini';
+  if (provider === 'agy') return 'Antigravity';
+  if (provider === 'hermes') return 'Hermes';
   if (provider === 'iterm2') return 'iTerm2';
   return 'Claude';
 }
 
 function sessionProvider(s) {
   const p = ((s && s.provider) || 'claude').toLowerCase();
-  return (p === 'codex' || p === 'gemini' || p === 'iterm2') ? p : 'claude';
+  return (p === 'codex' || p === 'gemini' || p === 'agy' || p === 'hermes' || p === 'iterm2') ? p : 'claude';
 }
 
 function providerDefaultModel(provider) {
   if (provider === 'codex') return 'gpt-5.5';
   if (provider === 'gemini') return 'auto';
+  if (provider === 'agy' || provider === 'hermes') return '';
   return window._AMUX_DEFAULT_MODEL || 'sonnet';
 }
 
@@ -15422,8 +15744,8 @@ function sessionConfiguredModel(s) {
 
 function providerYoloFlag(provider) {
   if (provider === 'codex') return '--dangerously-bypass-approvals-and-sandbox';
-  if (provider === 'gemini') return '--yolo';
-  return '--dangerously-skip-permissions';
+  if (provider === 'gemini' || provider === 'hermes') return '--yolo';
+  return '--dangerously-skip-permissions';  // claude + agy
 }
 
 function stripProviderYoloFlags(flags) {
@@ -16317,7 +16639,9 @@ function editField(session, field, current, provider) {
     const providers = [
       {v:'claude',l:'Claude Code'},
       {v:'codex',l:'Codex'},
-      {v:'gemini',l:'Gemini'}
+      {v:'agy',l:'Antigravity'},
+      {v:'hermes',l:'Hermes'},
+      {v:'gemini',l:'Gemini (deprecated)'}
     ];
     sel.innerHTML = '';
     providers.forEach(p => { const o = document.createElement('option'); o.value = p.v; o.textContent = p.l; sel.appendChild(o); });
@@ -16343,7 +16667,23 @@ function editField(session, field, current, provider) {
       {v:'gemini-2.5-flash',l:'gemini-2.5-flash'},{v:'gemini-2.5-flash-lite',l:'gemini-2.5-flash-lite'},
       {v:'gemini-3-pro-preview',l:'gemini-3-pro-preview'},{v:'gemini-3-flash-preview',l:'gemini-3-flash-preview'}
     ];
-    const models = provider === 'codex' ? codexModels : (provider === 'gemini' ? geminiModels : claudeModels);
+    const agyModels = [
+      {v:'',l:'Default'},
+      {v:'gemini-3.5-flash-medium',l:'Gemini 3.5 Flash (Medium)'},
+      {v:'gemini-3.5-flash-high',l:'Gemini 3.5 Flash (High)'},
+      {v:'gemini-3.5-flash-low',l:'Gemini 3.5 Flash (Low)'},
+      {v:'gemini-3.1-pro-low',l:'Gemini 3.1 Pro (Low)'},
+      {v:'gemini-3.1-pro-high',l:'Gemini 3.1 Pro (High)'},
+      {v:'claude-sonnet-4-6',l:'Claude Sonnet 4.6 (Thinking)'},
+      {v:'claude-opus-4-6',l:'Claude Opus 4.6 (Thinking)'},
+      {v:'gpt-oss-120b-medium',l:'GPT-OSS 120B (Medium)'}
+    ];
+    const hermesModels = [{v:'',l:'Default (from hermes config)'}];
+    const models = provider === 'codex' ? codexModels
+      : provider === 'gemini' ? geminiModels
+      : provider === 'agy' ? agyModels
+      : provider === 'hermes' ? hermesModels
+      : claudeModels;
     sel.innerHTML = '';
     models.forEach(m => { const o = document.createElement('option'); o.value = m.v; o.textContent = m.l; sel.appendChild(o); });
     inpWrap.style.display = 'none';
@@ -16535,8 +16875,8 @@ async function toggleYolo(session) {
     if (s) {
       const claudeFlag = '--dangerously-skip-permissions';
       const codexFlag = '--dangerously-bypass-approvals-and-sandbox';
-      const geminiFlag = '--yolo';
-      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(geminiFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
+      const hermesFlag = '--yolo';
+      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(hermesFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
       if (wasYolo) {
         s.flags = stripProviderYoloFlags(s.flags || '');
         s.auto_continue = false;
@@ -19409,9 +19749,12 @@ const _ACTION_CHIPS = [
     { id: 'transcripts', label: '\uD83D\uDCBE Transcripts', action: 'special', value: 'showTranscripts', desc: 'Conversation transcripts' },
 ];
 function _getAllChips() {
+  const s = sessions.find(x => x.name === peekSession);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
   return [
     { section: 'Actions', items: _ACTION_CHIPS },
-    { section: 'Slash Commands', items: SLASH_COMMANDS.map(c => ({
+    { section: 'Slash Commands', items: providerCmds.map(c => ({
       id: c.cmd.slice(1), label: c.cmd, action: 'slash', value: c.cmd, desc: c.desc
     })) },
   ];
@@ -20154,7 +20497,10 @@ function slashAcUpdate() {
   el._atItems = null; el._atSel = -1;
   if (!val.startsWith('/')) { el.classList.remove('open'); slashAcItems = []; return; }
   const q = val.toLowerCase();
-  slashAcItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(q));
+  const s = sessions.find(x => x.name === peekSession);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
+  slashAcItems = providerCmds.filter(c => c.cmd.startsWith(q));
   slashAcSelected = -1;
   if (!slashAcItems.length) { el.classList.remove('open'); return; }
   el.innerHTML = slashAcItems.map((c, i) =>
@@ -20386,7 +20732,10 @@ function cardSlashAcUpdate(name) {
   el._atItems = null; el._atSel = -1;
   if (!val.startsWith('/')) { el.classList.remove('open'); _cardAcItems = []; return; }
   const q = val.toLowerCase();
-  _cardAcItems = SLASH_COMMANDS.filter(c => c.cmd.startsWith(q));
+  const s = sessions.find(x => x.name === name);
+  const provider = (s && s.provider) || 'claude';
+  const providerCmds = Array.isArray(SLASH_COMMANDS) ? SLASH_COMMANDS : (SLASH_COMMANDS[provider] || SLASH_COMMANDS['claude'] || []);
+  _cardAcItems = providerCmds.filter(c => c.cmd.startsWith(q));
   _cardAcSelected = -1;
   if (!_cardAcItems.length) { el.classList.remove('open'); return; }
   el.innerHTML = _cardAcItems.map((c, i) =>
@@ -22025,6 +22374,8 @@ function _selectProvider(p) {
   _createProvider = p;
   document.getElementById('create-provider-claude').classList.toggle('selected', p === 'claude');
   document.getElementById('create-provider-codex').classList.toggle('selected', p === 'codex');
+  document.getElementById('create-provider-agy').classList.toggle('selected', p === 'agy');
+  document.getElementById('create-provider-hermes').classList.toggle('selected', p === 'hermes');
   document.getElementById('create-provider-gemini').classList.toggle('selected', p === 'gemini');
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
@@ -22036,6 +22387,8 @@ function openCreate() {
   _createProvider = 'claude';
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
+  document.getElementById('create-provider-agy').classList.remove('selected');
+  document.getElementById('create-provider-hermes').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = '';
   document.getElementById('create-template-field').style.display = '';
@@ -38241,7 +38594,7 @@ p{{color:#888;margin:12px 0 28px;font-size:0.9rem;line-height:1.5}}
                         return self._json({"error": "provider must be a string"}, 400)
                     provider_val = body["provider"].strip().lower()
                     if provider_val not in _SESSION_PROVIDERS:
-                        return self._json({"error": "provider must be 'claude', 'codex', or 'gemini'"}, 400)
+                        return self._json({"error": "provider must be one of: claude, codex, agy, hermes, gemini (deprecated)"}, 400)
                     old_provider = cfg.get("CC_PROVIDER", "claude").strip().lower() or "claude"
                     if old_provider not in _SESSION_PROVIDERS:
                         old_provider = "claude"
